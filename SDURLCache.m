@@ -455,7 +455,9 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
         return;
     }
 
-    [super storeCachedResponse:cachedResponse forRequest:request];
+    if ( [self memoryCapacity] > 0 ) {
+        [super storeCachedResponse:cachedResponse forRequest:request];
+    }
 
     NSURLCacheStoragePolicy storagePolicy = cachedResponse.storagePolicy;
     if ((storagePolicy == NSURLCacheStorageAllowed || (storagePolicy == NSURLCacheStorageAllowedInMemoryOnly && ignoreMemoryOnlyStoragePolicy))
@@ -504,11 +506,13 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 {
     request = [SDURLCache canonicalRequestForRequest:request];
 
-    NSCachedURLResponse *memoryResponse = [super cachedResponseForRequest:request];
-    if (memoryResponse)
-    {
-        SDURLCACHE_DEBUG( @"** DEBUG: memory response %@ for %@", memoryResponse, request.URL );
-        return memoryResponse;
+    if ( [self memoryCapacity] > 0 ) {
+        NSCachedURLResponse *memoryResponse = [super cachedResponseForRequest:request];
+        if (memoryResponse)
+        {
+            SDURLCACHE_DEBUG( @"** DEBUG: memory response %@ for %@", memoryResponse, request.URL );
+            return memoryResponse;
+        }
     }
 
     NSString *cacheKey = [SDURLCache cacheKeyForURL:request.URL];
@@ -528,8 +532,9 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
                 [accesses setObject:[NSDate date] forKey:cacheKey];
                 diskCacheInfoDirty = YES;
 
-                // OPTI: Store the response to memory cache for potential future requests
-                [super storeCachedResponse:diskResponse forRequest:request];
+                if ( [self memoryCapacity] > 0 ) {
+                    [super storeCachedResponse:diskResponse forRequest:request];
+                }
 
                 // SRK: Work around an interesting retainCount bug in CFNetwork on iOS << 3.2.
                 if (kCFCoreFoundationVersionNumber < kCFCoreFoundationVersionNumber_iPhoneOS_3_2)
@@ -570,14 +575,18 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 {
     request = [SDURLCache canonicalRequestForRequest:request];
 
-    [super removeCachedResponseForRequest:request];
+    if ( [self memoryCapacity] > 0 ) {
+        [super removeCachedResponseForRequest:request];
+    }
     [self removeCachedResponseForCachedKeys:[NSArray arrayWithObject:[SDURLCache cacheKeyForURL:request.URL]]];
     [self saveCacheInfo];
 }
 
 - (void)removeAllCachedResponses
 {
-    [super removeAllCachedResponses];
+    if ( [self memoryCapacity] > 0 ) {
+        [super removeAllCachedResponses];
+    }
     NSFileManager *fileManager = [NSFileManager defaultManager];
     [fileManager removeItemAtPath:diskCachePath error:NULL];
     @synchronized(self)
@@ -591,10 +600,15 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     NSURLRequest *request = [NSURLRequest requestWithURL:url];
     request = [SDURLCache canonicalRequestForRequest:request];
 
-    if ([super cachedResponseForRequest:request])
+    if ( [self memoryCapacity] > 0 && [super cachedResponseForRequest:request] )
     {
         return YES;
     }
+    return [self isCachedOnDisk:url];
+}
+
+- (BOOL)isCachedOnDisk:(NSURL *)url
+{
     NSString *cacheKey = [SDURLCache cacheKeyForURL:url];
     NSString *cacheFile = [diskCachePath stringByAppendingPathComponent:cacheKey];
     if ([[NSFileManager defaultManager] fileExistsAtPath:cacheFile])

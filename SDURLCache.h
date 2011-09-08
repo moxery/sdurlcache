@@ -50,6 +50,7 @@
  */
 - (BOOL)isCached:(NSURL *)url;
 
+- (BOOL)isCachedOnDisk:(NSURL *)url;
 
 /*
  * Additional mechanism to perform a synchronous write to cache data.  Default is async.
