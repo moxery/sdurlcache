@@ -9,6 +9,9 @@
 #import "SDURLCache.h"
 #import <CommonCrypto/CommonDigest.h>
 
+// #define SDURLCACHE_DEBUG( __MSG__, ... ) NSLog( __MSG__, ##__VA_ARGS__ )
+#define SDURLCACHE_DEBUG( __MSG__, ... ) (void)0
+
 static NSTimeInterval const kSDURLCacheInfoDefaultMinCacheInterval = 5 * 60; // 5 minute
 static NSString *const kSDURLCacheInfoFileName = @"cacheInfo.plist";
 static NSString *const kSDURLCacheInfoDiskUsageKey = @"diskUsage";
@@ -269,7 +272,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 
 - (void)createDiskCachePath
 {
-    NSFileManager *fileManager = [[NSFileManager alloc] init];
+    NSFileManager *fileManager = [NSFileManager defaultManager];
     if (![fileManager fileExistsAtPath:diskCachePath])
     {
         [fileManager createDirectoryAtPath:diskCachePath
@@ -277,7 +280,6 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
                                 attributes:nil
                                      error:NULL];
     }
-    [fileManager release];
 }
 
 - (void)saveCacheInfo
@@ -306,7 +308,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     {
         NSMutableDictionary *accesses = [self.diskCacheInfo objectForKey:kSDURLCacheInfoAccessesKey];
         NSMutableDictionary *sizes = [self.diskCacheInfo objectForKey:kSDURLCacheInfoSizesKey];
-        NSFileManager *fileManager = [[[NSFileManager alloc] init] autorelease];
+        NSFileManager *fileManager = [NSFileManager defaultManager];
 
         while ((cacheKey = [enumerator nextObject]))
         {
@@ -369,13 +371,16 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     if (![NSKeyedArchiver archiveRootObject:cachedResponse toFile:cacheFilePath])
     {
         // Caching failed for some reason
+        SDURLCACHE_DEBUG( @"** DEBUG: caching failed at %@ for %@", cacheFilePath, request.URL );
         return;
+    }
+    else {
+        SDURLCACHE_DEBUG( @"** DEBUG: stored %@ to %@", request.URL, cacheFilePath );
     }
 
     // Update disk usage info
-    NSFileManager *fileManager = [[NSFileManager alloc] init];
+    NSFileManager *fileManager = [NSFileManager defaultManager];
     NSNumber *cacheItemSize = [[fileManager attributesOfItemAtPath:cacheFilePath error:NULL] objectForKey:NSFileSize];
-    [fileManager release];
     @synchronized(self.diskCacheInfo)
     {
         diskCacheUsage += [cacheItemSize unsignedIntegerValue];
@@ -437,8 +442,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     return self;
 }
 
-- (void)storeCachedResponse:(NSCachedURLResponse *)cachedResponse forRequest:(NSURLRequest *)request
-{
+- (void)storeCachedResponse:(NSCachedURLResponse *)cachedResponse forRequest:(NSURLRequest *)request async:(BOOL)async {
     request = [SDURLCache canonicalRequestForRequest:request];
 
     if (request.cachePolicy == NSURLRequestReloadIgnoringLocalCacheData
@@ -470,15 +474,31 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
                 return;
             }
         }
-
-        [ioQueue addOperation:[[[NSInvocationOperation alloc] initWithTarget:self
+        
+        if ( async) {
+            [ioQueue addOperation:[[[NSInvocationOperation alloc] initWithTarget:self
                                                                     selector:@selector(storeToDisk:)
                                                                       object:[NSDictionary dictionaryWithObjectsAndKeys:
                                                                               cachedResponse, @"cachedResponse",
                                                                               request, @"request",
                                                                               nil]] autorelease]];
+        }
+        else {
+            [self storeToDisk:[NSDictionary dictionaryWithObjectsAndKeys:
+                               cachedResponse, @"cachedResponse",
+                               request, @"request",
+                               nil]];
+        }
+    }
+    else {
+        SDURLCACHE_DEBUG( @"** DEBUG: not storing %@", request.URL );
     }
 }
+
+- (void)storeCachedResponse:(NSCachedURLResponse *)cachedResponse forRequest:(NSURLRequest *)request {
+    [self storeCachedResponse:cachedResponse forRequest:request async:YES];
+}
+
 
 - (NSCachedURLResponse *)cachedResponseForRequest:(NSURLRequest *)request
 {
@@ -487,6 +507,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     NSCachedURLResponse *memoryResponse = [super cachedResponseForRequest:request];
     if (memoryResponse)
     {
+        SDURLCACHE_DEBUG( @"** DEBUG: memory response %@ for %@", memoryResponse, request.URL );
         return memoryResponse;
     }
 
@@ -497,7 +518,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     @synchronized(self.diskCacheInfo)
     {
         NSMutableDictionary *accesses = [self.diskCacheInfo objectForKey:kSDURLCacheInfoAccessesKey];
-        if ([accesses objectForKey:cacheKey]) // OPTI: Check for cache-hit in a in-memory dictionnary before to hit the FS
+        if ( YES || [accesses objectForKey:cacheKey]) // OPTI: Check for cache-hit in a in-memory dictionnary before to hit the FS
         {
             NSCachedURLResponse *diskResponse = [NSKeyedUnarchiver unarchiveObjectWithFile:[diskCachePath stringByAppendingPathComponent:cacheKey]];
             if (diskResponse)
@@ -521,6 +542,15 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
                     return diskResponse;
                 }
             }
+            else {
+                SDURLCACHE_DEBUG( @"** DEBUG: no disk response (exists: %d) for %@ at %@"
+                                 , [[NSFileManager defaultManager] fileExistsAtPath:[diskCachePath stringByAppendingPathComponent:cacheKey]]
+                                 , request.URL
+                                 , [diskCachePath stringByAppendingPathComponent:cacheKey] );
+            }
+        }
+        else {
+            SDURLCACHE_DEBUG( @"** DEBUG: no cached response for %@ as accesses objectForKey returns nil for %@", request.URL, cacheKey );
         }
     }
 
@@ -548,7 +578,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 - (void)removeAllCachedResponses
 {
     [super removeAllCachedResponses];
-    NSFileManager *fileManager = [[[NSFileManager alloc] init] autorelease];
+    NSFileManager *fileManager = [NSFileManager defaultManager];
     [fileManager removeItemAtPath:diskCachePath error:NULL];
     @synchronized(self)
     {
@@ -567,7 +597,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     }
     NSString *cacheKey = [SDURLCache cacheKeyForURL:url];
     NSString *cacheFile = [diskCachePath stringByAppendingPathComponent:cacheKey];
-    if ([[[[NSFileManager alloc] init] autorelease] fileExistsAtPath:cacheFile])
+    if ([[NSFileManager defaultManager] fileExistsAtPath:cacheFile])
     {
         return YES;
     }
