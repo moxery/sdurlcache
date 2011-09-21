@@ -241,8 +241,8 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 {
     if (!diskCacheInfo)
     {
-        @synchronized(self)
-        {
+        [cacheLock lock];
+        @try { 
             if (!diskCacheInfo) // Check again, maybe another thread created it while waiting for the mutex
             {
                 diskCacheInfo = [[NSMutableDictionary alloc] initWithContentsOfFile:[diskCachePath stringByAppendingPathComponent:kSDURLCacheInfoFileName]];
@@ -265,6 +265,9 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
                                                                             repeats:YES] retain];
             }
         }
+        @finally {
+            [cacheLock unlock];
+        }
     }
 
     return diskCacheInfo;
@@ -284,17 +287,26 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 
 - (void)saveCacheInfo
 {
-    [self createDiskCachePath];
-    @synchronized(self.diskCacheInfo)
-    {
-        NSData *data = [NSPropertyListSerialization dataFromPropertyList:self.diskCacheInfo format:NSPropertyListBinaryFormat_v1_0 errorDescription:NULL];
+    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+    if ( diskCacheInfoDirty ) {
+        NSData *data = nil;
+        [cacheLock lock];
+        @try {
+            if ( diskCacheInfoDirty ) {
+                data = [NSPropertyListSerialization dataFromPropertyList:self.diskCacheInfo format:NSPropertyListBinaryFormat_v1_0 errorDescription:NULL];
+                diskCacheInfoDirty = NO;
+            }                
+        }
+        @finally {
+            [cacheLock unlock];
+        }
         if (data)
         {
+            [self createDiskCachePath];
             [data writeToFile:[diskCachePath stringByAppendingPathComponent:kSDURLCacheInfoFileName] atomically:YES];
         }
-
-        diskCacheInfoDirty = NO;
     }
+    [pool drain];
 }
 
 - (void)removeCachedResponseForCachedKeys:(NSArray *)cacheKeys
@@ -304,22 +316,37 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     NSEnumerator *enumerator = [cacheKeys objectEnumerator];
     NSString *cacheKey;
 
-    @synchronized(self.diskCacheInfo)
-    {
+    NSMutableArray *filesToRemove = [NSMutableArray array];
+    NSUInteger freed = 0;
+
+    [cacheLock lock];
+    @try {
         NSMutableDictionary *accesses = [self.diskCacheInfo objectForKey:kSDURLCacheInfoAccessesKey];
         NSMutableDictionary *sizes = [self.diskCacheInfo objectForKey:kSDURLCacheInfoSizesKey];
-        NSFileManager *fileManager = [NSFileManager defaultManager];
 
         while ((cacheKey = [enumerator nextObject]))
         {
-            NSUInteger cacheItemSize = [[sizes objectForKey:cacheKey] unsignedIntegerValue];
+            freed += [[sizes objectForKey:cacheKey] unsignedIntegerValue];
             [accesses removeObjectForKey:cacheKey];
             [sizes removeObjectForKey:cacheKey];
-            [fileManager removeItemAtPath:[diskCachePath stringByAppendingPathComponent:cacheKey] error:NULL];
-
-            diskCacheUsage -= cacheItemSize;
-            [self.diskCacheInfo setObject:[NSNumber numberWithUnsignedInteger:diskCacheUsage] forKey:kSDURLCacheInfoDiskUsageKey];
+            [filesToRemove addObject:[diskCachePath stringByAppendingPathComponent:cacheKey]];
         }
+    }
+    @finally {
+        [cacheLock unlock];
+    }
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    for ( NSString *path in filesToRemove ) {
+        [fileManager removeItemAtPath:path error:NULL];
+    }
+    [cacheLock lock];
+    @try {
+        diskCacheUsage -= freed;
+        [self.diskCacheInfo setObject:[NSNumber numberWithUnsignedInteger:diskCacheUsage] forKey:kSDURLCacheInfoDiskUsageKey];
+        diskCacheInfoDirty = YES;
+    }
+    @finally {
+        [cacheLock unlock];
     }
 
     [pool drain];
@@ -335,8 +362,8 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 
     NSMutableArray *keysToRemove = [NSMutableArray array];
 
-    @synchronized(self.diskCacheInfo)
-    {
+    [cacheLock lock];
+    @try {
         // Apply LRU cache eviction algorithm while disk usage outreach capacity
         NSDictionary *sizes = [self.diskCacheInfo objectForKey:kSDURLCacheInfoSizesKey];
 
@@ -351,9 +378,11 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
             capacityToSave -= [(NSNumber *)[sizes objectForKey:cacheKey] unsignedIntegerValue];
         }
     }
+    @finally {
+        [cacheLock unlock];
+    }
 
     [self removeCachedResponseForCachedKeys:keysToRemove];
-    [self saveCacheInfo];
 }
 
 
@@ -381,8 +410,8 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     // Update disk usage info
     NSFileManager *fileManager = [NSFileManager defaultManager];
     NSNumber *cacheItemSize = [[fileManager attributesOfItemAtPath:cacheFilePath error:NULL] objectForKey:NSFileSize];
-    @synchronized(self.diskCacheInfo)
-    {
+    [cacheLock lock];
+    @try {
         diskCacheUsage += [cacheItemSize unsignedIntegerValue];
         [self.diskCacheInfo setObject:[NSNumber numberWithUnsignedInteger:diskCacheUsage] forKey:kSDURLCacheInfoDiskUsageKey];
 
@@ -391,8 +420,10 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
         [(NSMutableDictionary *)[self.diskCacheInfo objectForKey:kSDURLCacheInfoAccessesKey] setObject:[NSDate date] forKey:cacheKey];
         [(NSMutableDictionary *)[self.diskCacheInfo objectForKey:kSDURLCacheInfoSizesKey] setObject:cacheItemSize forKey:cacheKey];
     }
-
-    [self saveCacheInfo];
+    @finally {
+        [cacheLock unlock];
+    }
+    diskCacheInfoDirty = YES;
 }
 
 - (void)periodicMaintenance
@@ -437,12 +468,14 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
         ioQueue.maxConcurrentOperationCount = 1; // used to streamline operations in a separate thread
 
         self.ignoreMemoryOnlyStoragePolicy = YES;
+
+        cacheLock = [NSRecursiveLock new];
 	}
 
     return self;
 }
 
-- (void)storeCachedResponse:(NSCachedURLResponse *)cachedResponse forRequest:(NSURLRequest *)request async:(BOOL)async {
+- (void)storeCachedResponse:(NSCachedURLResponse *)cachedResponse forRequest:(NSURLRequest *)request {
     request = [SDURLCache canonicalRequestForRequest:request];
 
     if (request.cachePolicy == NSURLRequestReloadIgnoringLocalCacheData
@@ -477,30 +510,17 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
             }
         }
         
-        if ( async) {
-            [ioQueue addOperation:[[[NSInvocationOperation alloc] initWithTarget:self
+        [ioQueue addOperation:[[[NSInvocationOperation alloc] initWithTarget:self
                                                                     selector:@selector(storeToDisk:)
                                                                       object:[NSDictionary dictionaryWithObjectsAndKeys:
                                                                               cachedResponse, @"cachedResponse",
                                                                               request, @"request",
                                                                               nil]] autorelease]];
-        }
-        else {
-            [self storeToDisk:[NSDictionary dictionaryWithObjectsAndKeys:
-                               cachedResponse, @"cachedResponse",
-                               request, @"request",
-                               nil]];
-        }
     }
     else {
         SDURLCACHE_DEBUG( @"** DEBUG: not storing %@", request.URL );
     }
 }
-
-- (void)storeCachedResponse:(NSCachedURLResponse *)cachedResponse forRequest:(NSURLRequest *)request {
-    [self storeCachedResponse:cachedResponse forRequest:request async:YES];
-}
-
 
 - (NSCachedURLResponse *)cachedResponseForRequest:(NSURLRequest *)request
 {
@@ -519,17 +539,17 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 
     // NOTE: We don't handle expiration here as even staled cache data is necessary for NSURLConnection to handle cache revalidation.
     //       Staled cache data is also needed for cachePolicies which force the use of the cache.
-    @synchronized(self.diskCacheInfo)
-    {
-        NSMutableDictionary *accesses = [self.diskCacheInfo objectForKey:kSDURLCacheInfoAccessesKey];
-        if ( YES || [accesses objectForKey:cacheKey]) // OPTI: Check for cache-hit in a in-memory dictionnary before to hit the FS
-        {
+    [cacheLock lock];
+    @try {
+        NSMutableDictionary *sizes = [self.diskCacheInfo objectForKey:kSDURLCacheInfoSizesKey];
+        if (  [sizes objectForKey:cacheKey] ) {
             NSCachedURLResponse *diskResponse = [NSKeyedUnarchiver unarchiveObjectWithFile:[diskCachePath stringByAppendingPathComponent:cacheKey]];
             if (diskResponse)
             {
                 // OPTI: Log the entry last access time for LRU cache eviction algorithm but don't save the dictionary
                 //       on disk now in order to save IO and time
-                [accesses setObject:[NSDate date] forKey:cacheKey];
+                NSDate *oldDate = [[[[self.diskCacheInfo objectForKey:kSDURLCacheInfoAccessesKey] objectForKey:cacheKey] retain] autorelease];
+                [[self.diskCacheInfo objectForKey:kSDURLCacheInfoAccessesKey] setObject:[NSDate date] forKey:cacheKey];
                 diskCacheInfoDirty = YES;
 
                 if ( [self memoryCapacity] > 0 ) {
@@ -544,6 +564,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 
                 if (diskResponse)
                 {
+                    NSLog( @"cache hit: %@ %@ %@ <%@>", [sizes objectForKey:cacheKey], oldDate, cacheKey, request.URL );
                     return diskResponse;
                 }
             }
@@ -554,9 +575,9 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
                                  , [diskCachePath stringByAppendingPathComponent:cacheKey] );
             }
         }
-        else {
-            SDURLCACHE_DEBUG( @"** DEBUG: no cached response for %@ as accesses objectForKey returns nil for %@", request.URL, cacheKey );
-        }
+    }
+    @finally {
+        [cacheLock unlock];
     }
 
     return nil;
@@ -579,7 +600,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
         [super removeCachedResponseForRequest:request];
     }
     [self removeCachedResponseForCachedKeys:[NSArray arrayWithObject:[SDURLCache cacheKeyForURL:request.URL]]];
-    [self saveCacheInfo];
+    diskCacheInfoDirty = YES;
 }
 
 - (void)removeAllCachedResponses
@@ -589,9 +610,12 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     }
     NSFileManager *fileManager = [NSFileManager defaultManager];
     [fileManager removeItemAtPath:diskCachePath error:NULL];
-    @synchronized(self)
-    {
+    [cacheLock lock];
+    @try {
         [diskCacheInfo release], diskCacheInfo = nil;
+    }
+    @finally {
+        [cacheLock unlock];
     }
 }
 
@@ -628,6 +652,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     [diskCachePath release], diskCachePath = nil;
     [diskCacheInfo release], diskCacheInfo = nil;
     [ioQueue release], ioQueue = nil;
+    [cacheLock release], cacheLock = nil;
     [super dealloc];
 }
 
