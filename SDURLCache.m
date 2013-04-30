@@ -605,7 +605,7 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
 
                 if (diskResponse)
                 {
-                    NSLog( @"cache hit: %@ %@ %@ <%@>", [sizes objectForKey:cacheKey], oldDate, cacheKey, request.URL );
+                    NSLog( @"cache hit: %@ %@ <%@>", oldDate, cacheKey, request.URL );
                     return diskResponse;
                 }
             }
@@ -617,10 +617,6 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
             }
         }
     }
-    @finally {
-        [cacheLock unlock];
-    }
-
     return nil;
 }
 
@@ -664,9 +660,6 @@ static NSDateFormatter* CreateDateFormatter(NSString *format)
     @synchronized(self)
     {
         [diskCacheInfo release], diskCacheInfo = nil;
-    }
-    @finally {
-        [cacheLock unlock];
     }
 }
 

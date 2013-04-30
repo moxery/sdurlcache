@@ -62,6 +62,4 @@
  */
 - (BOOL)isCached:(NSURL *)url;
 
-- (BOOL)isCachedOnDisk:(NSURL *)url;
-
 @end
