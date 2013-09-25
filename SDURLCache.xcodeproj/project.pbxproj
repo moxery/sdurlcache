@@ -280,7 +280,6 @@
 				PRODUCT_NAME = SDURLCache;
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
-				VALID_ARCHS = "armv7 armv7s";
 			};
 			name = Release;
 		};
